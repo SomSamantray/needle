@@ -440,7 +440,8 @@ def _temporal_grounding(text, schema, arguments, system=None):
     return _walk_grounding(schema, arguments, years)
 
 
-_NUMBER_TOKEN = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
+_NUMBER_TOKEN = re.compile(
+    r"(?<![\w.,])(?:[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?)(?!\d)")
 
 
 def _numeric_paths(arguments, path=""):
@@ -461,33 +462,25 @@ def _numeric_paths(arguments, path=""):
             yield from _numeric_paths(item, f"{path}[{index}]")
 
 
-def _number_in_source(text, value):
-    """Whether ``value`` appears in ``text`` as a whole number token.
-
-    Compares numerically, so a thousands separator does not hide the match:
-    the engine emits ``1200.0`` for a source written ``$1,200.00`` and its
-    literal substring check reports that value as fabricated (issue #120).
-    """
-    try:
-        target = decimal.Decimal(str(value))
-    except (decimal.InvalidOperation, ValueError):
-        return False
-    for match in _NUMBER_TOKEN.finditer(text):
-        try:
-            if decimal.Decimal(match.group(0).replace(",", "")) == target:
-                return True
-        except decimal.InvalidOperation:
-            continue
-    return False
+def _source_numbers(*sources):
+    """Numeric values written in the source texts, separators normalized."""
+    text = "\n".join(source for source in sources if source)
+    return {decimal.Decimal(match.group(0).replace(",", ""))
+            for match in _NUMBER_TOKEN.finditer(text)}
 
 
 def _grounded_number_paths(arguments, *sources):
-    """Paths in ``arguments`` whose number is present in any source text."""
-    text = "\n".join(source for source in sources if source)
-    if not text:
+    numbers = _source_numbers(*sources)
+    if not numbers:
         return set()
-    return {path for path, value in _numeric_paths(arguments)
-            if _number_in_source(text, value)}
+    grounded = set()
+    for path, value in _numeric_paths(arguments):
+        try:
+            if decimal.Decimal(str(value)) in numbers:
+                grounded.add(path)
+        except (decimal.InvalidOperation, ValueError):
+            continue
+    return grounded
 
 
 def _ungrounded_paths(response):
@@ -523,9 +516,10 @@ def _annotate_ungrounded(response, tool_schemas, seen_years, system=None):
 
 def _validate_extraction(text, schema, arguments, response, system=None):
     checked, failures = _temporal_grounding(text, schema, arguments, system)
-    grounded = _grounded_number_paths(arguments, text, system)
     validation = response.get("validation") or {}
-    for name in validation.get("ungrounded") or []:
+    flagged = validation.get("ungrounded") or []
+    grounded = _grounded_number_paths(arguments, text, system) if flagged else set()
+    for name in flagged:
         path = name.split(".", 1)[-1]
         if path in grounded:
             continue

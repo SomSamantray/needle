@@ -68,10 +68,18 @@ def _invoice(total, due_date="2026-09-01"):
     return {"vendor": "Acme Corp", "total": total, "due_date": due_date}
 
 
-def _extract_envelope(arguments, ungrounded=("Invoice.total",), name="Invoice"):
+def _envelope(arguments, name, ungrounded):
     return {"type": "call", "confidence": 0.9,
             "function_calls": [{"name": name, "arguments": arguments}],
             "validation": {"ungrounded": list(ungrounded), "negation": False}}
+
+
+def _extract_envelope(arguments, ungrounded=("Invoice.total",), name="Invoice"):
+    return _envelope(arguments, name, ungrounded)
+
+
+def _run_envelope(arguments, ungrounded=("set_thermostat.temperature",)):
+    return _envelope(arguments, "set_thermostat", ungrounded)
 
 
 def _call(due_date, name="Invoice"):
@@ -224,7 +232,8 @@ def test_extract_does_not_clear_a_digit_run_inside_a_longer_number(stub):
     import needle
 
     for source in ("Invoice from Acme Corp, $12,000.00, due 2026-09-01",
-                   "Invoice from Acme Corp, $11,200.00, due 2026-09-01"):
+                   "Invoice from Acme Corp, $11,200.00, due 2026-09-01",
+                   "Invoice from Acme Corp, $1,2000.00, due 2026-09-01"):
         stub.envelopes = [_extract_envelope(_invoice(1200.0))]
         with pytest.raises(needle.ExtractionValidationError):
             needle.extract(source, Invoice)
@@ -236,6 +245,35 @@ def test_extract_does_not_clear_a_number_absent_from_the_source(stub):
     stub.envelopes = [_extract_envelope(_invoice(1200.0))]
     with pytest.raises(needle.ExtractionValidationError):
         needle.extract("Invoice from Acme Corp, due 2026-09-01", Invoice)
+
+
+def test_extract_does_not_read_a_date_hyphen_as_a_minus_sign(stub):
+    import needle
+
+    for value in (-9.0, -1.0):
+        stub.envelopes = [_extract_envelope(_invoice(value))]
+        with pytest.raises(needle.ExtractionValidationError):
+            needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01",
+                           Invoice)
+
+
+def test_extract_does_not_read_a_range_hyphen_as_a_minus_sign(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(-1400.0))]
+    with pytest.raises(needle.ExtractionValidationError):
+        needle.extract("Invoice from Acme Corp, $1,200.00-1,400.00, due 2026-09-01",
+                       Invoice)
+
+
+def test_extract_clears_a_written_negative(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(-1200.0))]
+    invoice = needle.extract("Invoice from Acme Corp, -1,200.00, due 2026-09-01",
+                             Invoice)
+
+    assert invoice.total == -1200.0
 
 
 def test_extract_clears_a_zero_against_its_source(stub):
@@ -267,12 +305,8 @@ def test_run_executes_a_grounded_number_and_refuses_an_ungrounded_sibling(stub):
 def test_run_executes_a_separated_number_grounded_in_the_query(stub):
     import needle
 
-    envelope = {"type": "call", "confidence": 0.9,
-                "function_calls": [{"name": "set_thermostat",
-                                    "arguments": {"temperature": 1200}}],
-                "validation": {"ungrounded": ["set_thermostat.temperature"],
-                               "negation": False}}
-    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    stub.envelopes = [_run_envelope({"temperature": 1200}),
+                      {"type": "respond", "function_calls": []}]
     agent = needle.Needle(tools=[set_thermostat])
     response = agent.run("set it to 1,200")
 
@@ -282,12 +316,8 @@ def test_run_executes_a_separated_number_grounded_in_the_query(stub):
 def test_run_refuses_a_number_absent_from_the_query(stub):
     import needle
 
-    envelope = {"type": "call", "confidence": 0.9,
-                "function_calls": [{"name": "set_thermostat",
-                                    "arguments": {"temperature": 99}}],
-                "validation": {"ungrounded": ["set_thermostat.temperature"],
-                               "negation": False}}
-    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    stub.envelopes = [_run_envelope({"temperature": 99}),
+                      {"type": "respond", "function_calls": []}]
     agent = needle.Needle(tools=[set_thermostat])
     response = agent.run("make it 21 and cool the room")
 
@@ -297,12 +327,9 @@ def test_run_refuses_a_number_absent_from_the_query(stub):
 def test_run_still_refuses_a_non_numeric_engine_flag(stub):
     import needle
 
-    envelope = {"type": "call", "confidence": 0.9,
-                "function_calls": [{"name": "set_thermostat",
-                                    "arguments": {"temperature": 21}}],
-                "validation": {"ungrounded": ["set_thermostat.mode"],
-                               "negation": False}}
-    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    stub.envelopes = [_run_envelope({"temperature": 21},
+                                    ungrounded=("set_thermostat.mode",)),
+                      {"type": "respond", "function_calls": []}]
     agent = needle.Needle(tools=[set_thermostat])
     response = agent.run("make it 21 and cool the room")
 
