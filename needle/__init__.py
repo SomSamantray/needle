@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import decimal
 import json
 import os
 import re
@@ -297,6 +298,11 @@ class Needle:
                 name = str(call.get("name"))
                 fabricated = sorted(ungrounded.get(name, ()))
                 if strict and fabricated:
+                    grounded = _grounded_number_paths(
+                        call.get("arguments") or {}, query, self._system_text)
+                    fabricated = [path for path in fabricated
+                                  if path not in grounded]
+                if strict and fabricated:
                     results.append({"error": "ungrounded " + ", ".join(fabricated)})
                     continue
                 fn = self._functions.get(call.get("name"))
@@ -434,6 +440,56 @@ def _temporal_grounding(text, schema, arguments, system=None):
     return _walk_grounding(schema, arguments, years)
 
 
+_NUMBER_TOKEN = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[-+]?\d+(?:\.\d+)?")
+
+
+def _numeric_paths(arguments, path=""):
+    """Yield ``(path, value)`` for every numeric leaf, arguments-relative.
+
+    Paths match the form both call sites derive after stripping the engine's
+    tool prefix, so a flagged ``Tool.path`` resolves to a helper path.
+    """
+    if isinstance(arguments, bool):
+        return
+    if isinstance(arguments, (int, float)):
+        yield path, arguments
+    elif isinstance(arguments, dict):
+        for key, item in arguments.items():
+            yield from _numeric_paths(item, f"{path}.{key}" if path else str(key))
+    elif isinstance(arguments, list):
+        for index, item in enumerate(arguments):
+            yield from _numeric_paths(item, f"{path}[{index}]")
+
+
+def _number_in_source(text, value):
+    """Whether ``value`` appears in ``text`` as a whole number token.
+
+    Compares numerically, so a thousands separator does not hide the match:
+    the engine emits ``1200.0`` for a source written ``$1,200.00`` and its
+    literal substring check reports that value as fabricated (issue #120).
+    """
+    try:
+        target = decimal.Decimal(str(value))
+    except (decimal.InvalidOperation, ValueError):
+        return False
+    for match in _NUMBER_TOKEN.finditer(text):
+        try:
+            if decimal.Decimal(match.group(0).replace(",", "")) == target:
+                return True
+        except decimal.InvalidOperation:
+            continue
+    return False
+
+
+def _grounded_number_paths(arguments, *sources):
+    """Paths in ``arguments`` whose number is present in any source text."""
+    text = "\n".join(source for source in sources if source)
+    if not text:
+        return set()
+    return {path for path, value in _numeric_paths(arguments)
+            if _number_in_source(text, value)}
+
+
 def _ungrounded_paths(response):
     validation = response.get("validation") or {}
     grouped = {}
@@ -467,9 +523,12 @@ def _annotate_ungrounded(response, tool_schemas, seen_years, system=None):
 
 def _validate_extraction(text, schema, arguments, response, system=None):
     checked, failures = _temporal_grounding(text, schema, arguments, system)
+    grounded = _grounded_number_paths(arguments, text, system)
     validation = response.get("validation") or {}
     for name in validation.get("ungrounded") or []:
         path = name.split(".", 1)[-1]
+        if path in grounded:
+            continue
         if path not in checked or path in failures:
             failures.add(path)
     if validation.get("negation"):

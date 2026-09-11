@@ -1,5 +1,6 @@
 import datetime
 import json
+from typing import List
 
 import pydantic
 import pytest
@@ -42,6 +43,35 @@ def stub(monkeypatch):
 class Invoice(pydantic.BaseModel):
     vendor: str
     due_date: datetime.date
+    total: float = 0.0
+
+
+class LineItem(pydantic.BaseModel):
+    price: float
+
+
+class Order(pydantic.BaseModel):
+    items: List[LineItem]
+
+
+def set_thermostat(temperature: int, mode: str = "auto"):
+    """Set the thermostat.
+
+    Args:
+        temperature: target temperature in Celsius
+        mode: heating strategy to use
+    """
+    return {"temperature": temperature, "mode": mode}
+
+
+def _invoice(total, due_date="2026-09-01"):
+    return {"vendor": "Acme Corp", "total": total, "due_date": due_date}
+
+
+def _extract_envelope(arguments, ungrounded=("Invoice.total",), name="Invoice"):
+    return {"type": "call", "confidence": 0.9,
+            "function_calls": [{"name": name, "arguments": arguments}],
+            "validation": {"ungrounded": list(ungrounded), "negation": False}}
 
 
 def _call(due_date, name="Invoice"):
@@ -128,3 +158,152 @@ def test_engine_reported_fabrications_are_kept_and_block_execution(stub):
 
     assert response["results"] == [{"error": "ungrounded vendor"}]
     assert stub.calls[-1] == ("complete", json.dumps([{"error": "ungrounded vendor"}]))
+
+
+def test_extract_clears_a_thousands_separated_number(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(1200.0))]
+    invoice = needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01", Invoice)
+
+    assert invoice.total == 1200.0
+    assert invoice.due_date == datetime.date(2026, 9, 1)
+
+
+def test_extract_clears_a_thousands_separated_integer(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(1200))]
+    invoice = needle.extract("Invoice from Acme Corp, $1,200, due 2026-09-01", Invoice)
+
+    assert invoice.total == 1200
+
+
+def test_extract_leaves_an_unseparated_number_working(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(1200.0))]
+    invoice = needle.extract("Invoice from Acme Corp, $1200.00, due 2026-09-01", Invoice)
+
+    assert invoice.total == 1200.0
+
+
+def test_extract_still_rejects_a_fabricated_number(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(9999.0))]
+    with pytest.raises(needle.ExtractionValidationError) as excinfo:
+        needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01", Invoice)
+
+    assert "total" in str(excinfo.value)
+
+
+def test_extract_still_rejects_a_non_numeric_engine_flag(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(1200.0),
+                                        ungrounded=("Invoice.vendor",))]
+    with pytest.raises(needle.ExtractionValidationError) as excinfo:
+        needle.extract("Invoice from Acme Corp, $1,200.00, due 2026-09-01", Invoice)
+
+    assert "vendor" in str(excinfo.value)
+
+
+def test_extract_clears_a_nested_separated_number(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope({"items": [{"price": 1100.0}]},
+                                        ungrounded=("Order.items[0].price",),
+                                        name="Order")]
+    order = needle.extract("Order with one item priced $1,100.00", Order)
+
+    assert order.items[0].price == 1100.0
+
+
+def test_extract_does_not_clear_a_digit_run_inside_a_longer_number(stub):
+    import needle
+
+    for source in ("Invoice from Acme Corp, $12,000.00, due 2026-09-01",
+                   "Invoice from Acme Corp, $11,200.00, due 2026-09-01"):
+        stub.envelopes = [_extract_envelope(_invoice(1200.0))]
+        with pytest.raises(needle.ExtractionValidationError):
+            needle.extract(source, Invoice)
+
+
+def test_extract_does_not_clear_a_number_absent_from_the_source(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(1200.0))]
+    with pytest.raises(needle.ExtractionValidationError):
+        needle.extract("Invoice from Acme Corp, due 2026-09-01", Invoice)
+
+
+def test_extract_clears_a_zero_against_its_source(stub):
+    import needle
+
+    stub.envelopes = [_extract_envelope(_invoice(0.0))]
+    invoice = needle.extract("Invoice from Acme Corp, $0.00, due 2026-09-01", Invoice)
+
+    assert invoice.total == 0.0
+
+
+def test_run_executes_a_grounded_number_and_refuses_an_ungrounded_sibling(stub):
+    import needle
+
+    envelope = {"type": "call", "confidence": 0.9,
+                "function_calls": [
+                    {"name": "set_thermostat", "arguments": {"temperature": 21}},
+                    {"name": "set_thermostat", "arguments": {"temperature": 22}}],
+                "validation": {"ungrounded": ["set_thermostat.temperature"],
+                               "negation": False}}
+    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    agent = needle.Needle(tools=[set_thermostat])
+    response = agent.run("make it 21 and cool the room")
+
+    assert response["results"] == [{"temperature": 21, "mode": "auto"},
+                                   {"error": "ungrounded temperature"}]
+
+
+def test_run_executes_a_separated_number_grounded_in_the_query(stub):
+    import needle
+
+    envelope = {"type": "call", "confidence": 0.9,
+                "function_calls": [{"name": "set_thermostat",
+                                    "arguments": {"temperature": 1200}}],
+                "validation": {"ungrounded": ["set_thermostat.temperature"],
+                               "negation": False}}
+    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    agent = needle.Needle(tools=[set_thermostat])
+    response = agent.run("set it to 1,200")
+
+    assert response["results"] == [{"temperature": 1200, "mode": "auto"}]
+
+
+def test_run_refuses_a_number_absent_from_the_query(stub):
+    import needle
+
+    envelope = {"type": "call", "confidence": 0.9,
+                "function_calls": [{"name": "set_thermostat",
+                                    "arguments": {"temperature": 99}}],
+                "validation": {"ungrounded": ["set_thermostat.temperature"],
+                               "negation": False}}
+    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    agent = needle.Needle(tools=[set_thermostat])
+    response = agent.run("make it 21 and cool the room")
+
+    assert response["results"] == [{"error": "ungrounded temperature"}]
+
+
+def test_run_still_refuses_a_non_numeric_engine_flag(stub):
+    import needle
+
+    envelope = {"type": "call", "confidence": 0.9,
+                "function_calls": [{"name": "set_thermostat",
+                                    "arguments": {"temperature": 21}}],
+                "validation": {"ungrounded": ["set_thermostat.mode"],
+                               "negation": False}}
+    stub.envelopes = [envelope, {"type": "respond", "function_calls": []}]
+    agent = needle.Needle(tools=[set_thermostat])
+    response = agent.run("make it 21 and cool the room")
+
+    assert response["results"] == [{"error": "ungrounded mode"}]
